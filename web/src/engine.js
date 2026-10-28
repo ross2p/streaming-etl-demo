@@ -1,0 +1,163 @@
+const AREAS = ["center", "station", "airport"];
+const WINDOW = 30, BASE = 100, T0 = 1767225600;
+const rnd = n => Math.floor(Math.random() * n);
+const pick = a => a[rnd(a.length)];
+
+function murmur2(b) {
+  const m = 0x5bd1e995; let h = (0x9747b28c ^ b.length) >>> 0; const l4 = b.length >> 2;
+  for (let i = 0; i < l4; i++) {
+    const j = i * 4; let k = (b[j] | b[j+1] << 8 | b[j+2] << 16 | b[j+3] << 24) >>> 0;
+    k = Math.imul(k, m) >>> 0; k = (k ^ (k >>> 24)) >>> 0; k = Math.imul(k, m) >>> 0;
+    h = Math.imul(h, m) >>> 0; h = (h ^ k) >>> 0;
+  }
+  const ex = b.length % 4, base = b.length & ~3;
+  if (ex >= 3) h = (h ^ (b[base+2] << 16)) >>> 0;
+  if (ex >= 2) h = (h ^ (b[base+1] << 8)) >>> 0;
+  if (ex >= 1) { h = (h ^ b[base]) >>> 0; h = Math.imul(h, m) >>> 0; }
+  h = (h ^ (h >>> 13)) >>> 0; h = Math.imul(h, m) >>> 0; return (h ^ (h >>> 15)) >>> 0;
+}
+const partitionOf = key => (murmur2([...new TextEncoder().encode(key)]) & 0x7fffffff) % 3;
+
+const mmss = s => String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+const rel = abs => (abs >= T0 && abs < T0 + 86400) ? mmss(abs - T0) : String(abs);
+const toText = ev => JSON.stringify(ev, null, 2);
+
+function randomEvent(gen, msgs) {
+  if (msgs.length && Math.random() < 0.07) {
+    const old = msgs.filter(m => m.ev);
+    if (old.length) return { ...pick(old).ev };
+  }
+  gen.clock += rnd(4);
+  let t = T0 + gen.clock;
+  if (Math.random() < 0.12) t = T0 + Math.max(0, gen.clock - (6 + rnd(20)));
+  const area = Math.random() < 0.55 ? pick([" Center ", "center", "Center"])
+             : Math.random() < 0.6 ? "airport" : Math.random() < 0.9 ? "station" : "unknown";
+  const driver = Math.random() < 0.4;
+  return { event_id: "ev-" + (++gen.counter), event_time: t, area,
+           kind: driver ? "driver_available" : "ride_request", driver_id: driver ? "driver-" + (1 + rnd(5)) : null };
+}
+
+const initialState = () => ({
+  n: 0, msgs: [], db: [], last: null, narr: null, changedWin: null, newId: null,
+  maxWin: -Infinity, maxTime: T0 + 1, processed: 0, sentN: null, runs: [], freshRun: null,
+});
+
+const N = (...parts) => parts;
+
+function produce(state, text) {
+  let ev = null, err = null;
+  try { ev = JSON.parse(text); if (ev === null || typeof ev !== "object" || Array.isArray(ev)) err = "JSON не є об’єктом"; }
+  catch (e) { err = "не JSON"; }
+  const n = state.n + 1;
+  const key = !err && typeof ev.area === "string" ? ev.area.trim().toLowerCase() : null;
+  const p = key !== null ? partitionOf(key) : 0;
+  const off = state.msgs.filter(m => m.p === p).length;
+  const m = { n, raw: text, ev: err ? null : ev, parseErr: err, p, off, state: "wait", late: false };
+  const maxTime = !err && Number.isInteger(ev.event_time) ? Math.max(state.maxTime, ev.event_time) : state.maxTime;
+  return { ...state, n, msgs: [...state.msgs, m], maxTime, sentN: n };
+}
+
+function transform(ev) {
+  if (ev === null || typeof ev !== "object" || Array.isArray(ev)) throw "подія повинна бути JSON-об'єктом";
+  if (typeof ev.event_id !== "string" || !ev.event_id.trim()) throw "немає event_id";
+  if (typeof ev.area !== "string" || !AREAS.includes(ev.area.trim().toLowerCase())) throw "невідомий район";
+  if (ev.kind !== "ride_request" && ev.kind !== "driver_available") throw "невідомий тип події";
+  if (!Number.isInteger(ev.event_time) || ev.event_time < 0 || ev.event_time > 32503680000) throw "event_time має бути цілим Unix-часом";
+  let driver = null;
+  if (ev.kind === "driver_available") {
+    if (typeof ev.driver_id !== "string" || !ev.driver_id.trim()) throw "для водія потрібен driver_id";
+    driver = ev.driver_id.trim();
+  }
+  return { id: ev.event_id.trim(), time: ev.event_time, area: ev.area.trim().toLowerCase(), kind: ev.kind, driver,
+           wstart: Math.floor(ev.event_time / WINDOW) * WINDOW };
+}
+
+function result(db, area, ws) {
+  const rows = db.filter(r => r.area === area && r.wstart === ws);
+  const req = rows.filter(r => r.kind === "ride_request").length;
+  const drv = new Set(rows.filter(r => r.kind === "driver_available").map(r => r.driver)).size;
+  if (!drv) return { req, drv, mult: null, price: null };
+  const mult = Math.round(Math.min(3, Math.max(1, req / drv)) * 100) / 100;
+  return { req, drv, mult, price: Math.round(BASE * mult * 100) / 100 };
+}
+
+function consumeOne(state) {
+  const idx = state.msgs.findIndex(m => m.state === "wait");
+  if (idx < 0) return state;
+  const m = state.msgs[idx];
+  const put = patch => state.msgs.map((x, i) => i === idx ? { ...x, ...patch } : x);
+  const base = { ...state, processed: state.processed + 1, changedWin: null, newId: null };
+  const out = { n: m.n, E: "повідомлення #" + m.n + " · partition " + m.p + ", offset " + m.off };
+  let c;
+  try {
+    if (m.parseErr) throw m.parseErr;
+    c = transform(m.ev);
+  } catch (e) {
+    return { ...base, msgs: put({ state: "bad", reason: e }),
+      last: { ...out, T: "ПОМИЛКА: " + e, L: "не записуємо, consumer іде далі", stop: "T" },
+      narr: N({ b: "INVALID. " }, "Transform відхилив повідомлення #" + m.n + ": " + e + ". Подію не записано, але consumer працює далі.") };
+  }
+  out.T = "area → «" + c.area + "», window_start = " + rel(c.wstart);
+  if (state.db.some(r => r.id === c.id)) {
+    return { ...base, msgs: put({ state: "dup" }), last: { ...out, L: "INSERT … ON CONFLICT DO NOTHING → 0 рядків", stop: "L" },
+      narr: N({ b: "DUPLICATE. " }, "event_id «" + c.id + "» уже збережений. PRIMARY KEY не пускає його вдруге, тому підрахунок не змінюється.") };
+  }
+  const driverSeen = c.kind === "driver_available" && state.db.some(r => r.area === c.area && r.wstart === c.wstart && r.driver === c.driver);
+  const late = c.wstart < state.maxWin;
+  const db = [...state.db, c];
+  const r = result(db, c.area, c.wstart);
+  const tail = r.mult ? ": ×" + r.mult.toFixed(2) + ", " + r.price + " грн." : ": водіїв немає, ціни немає.";
+  let narr;
+  if (late) narr = N({ b: "Запізніла подія. " }, "Її час належить вікну " + rel(c.wstart) + ", яке вже закрилось, але вікно просто перераховується: " + r.req + " запитів, " + r.drv + " водіїв" + tail);
+  else if (driverSeen) narr = N({ b: "Повторний сигнал того самого водія. " }, "event_id новий, тож рядок записано, але COUNT(DISTINCT driver_id) лишається " + r.drv + tail);
+  else if (c.kind === "ride_request") narr = N({ b: "Запит пасажира " }, "у районі " + c.area + ": " + r.req + " запитів, " + r.drv + " водіїв" + tail);
+  else narr = N({ b: "Водій " + c.driver + " доступний " }, "у районі " + c.area + ": " + r.req + " запитів, " + r.drv + " водіїв" + tail);
+  return { ...base, db, msgs: put({ state: "ok", late }), maxWin: Math.max(state.maxWin, c.wstart), newId: c.id,
+           changedWin: c.area + "|" + c.wstart, last: { ...out, L: "INSERT → 1 рядок (усього " + db.length + ")" }, narr };
+}
+
+function runBatch(state) {
+  if (!state.db.length) return { ...state, narr: N({ b: "Batch. " }, "У taxi_events ще немає подій. Надішліть кілька повідомлень і натисніть кнопку знову.") };
+  const until = Math.max(...state.db.map(r => r.time)), since = until - 120;
+  const rows = state.db.filter(r => r.time > since && r.time <= until);
+  const byWin = new Map();
+  for (const r of rows) {
+    const k = r.area + "|" + r.wstart;
+    if (!byWin.has(k)) byWin.set(k, { area: r.area, wstart: r.wstart, req: 0, drv: new Set() });
+    const w = byWin.get(k);
+    if (r.kind === "ride_request") w.req++; else w.drv.add(r.driver);
+  }
+  const stats = [...byWin.values()].sort((a, b) => a.wstart - b.wstart || a.area.localeCompare(b.area)).map(w => {
+    const drivers = w.drv.size;
+    const mult = drivers ? Math.round(Math.min(3, Math.max(1, w.req / drivers)) * 100) / 100 : null;
+    return { area: w.area, wstart: w.wstart, req: w.req, drv: drivers, mult, price: mult ? Math.round(BASE * mult * 100) / 100 : null };
+  });
+  const areas = [...new Set(rows.map(r => r.area))].sort().map(a => {
+    const mine = rows.filter(r => r.area === a), priced = stats.filter(s => s.area === a && s.mult);
+    return { area: a, req: mine.filter(r => r.kind === "ride_request").length,
+             drv: new Set(mine.filter(r => r.kind === "driver_available").map(r => r.driver)).size,
+             peak: priced.length ? Math.max(...priced.map(s => s.mult)) : null,
+             peakPrice: priced.length ? Math.max(...priced.map(s => s.price)) : null };
+  });
+  const id = state.runs.length + 1;
+  return { ...state, runs: [{ id, since, until, events: rows.length, stats, areas, total: state.db.length }, ...state.runs], freshRun: id,
+    narr: N({ b: "Batch #" + id + ". " }, "За останні 2 хвилини (" + rel(since) + "–" + rel(until) + ") знайдено " + rows.length + " подій. Їх згруповано у " + stats.length + " вікон і записано в taxi_analytics одним запитом на читання та однією транзакцією. Стрімінг тим часом працює далі.") };
+}
+
+function reducer(state, action) {
+  switch (action.type) {
+    case "send": {
+      const s = produce(state, action.text);
+      if (action.consumerOn) return consumeOne(s);
+      const lag = s.msgs.filter(m => m.state === "wait").length;
+      return { ...s, narr: N({ b: "Consumer зупинений. " }, "Kafka зберегла повідомлення #" + s.n + ". Необроблених: " + lag + ". Увімкніть consumer, і він дочитає їх із підтвердженої позиції.") };
+    }
+    case "drain": return state.msgs.some(m => m.state === "wait") ? consumeOne(state) : state;
+    case "note": return { ...state, narr: action.narr };
+    case "batch": return runBatch(state);
+    case "reset": return initialState();
+    default: return state;
+  }
+}
+
+export { T0, rnd, pick, rel, toText, randomEvent, initialState, reducer, result, N };
