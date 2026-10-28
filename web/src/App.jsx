@@ -87,10 +87,6 @@ export default function App() {
     <div className="wrap">
       <header>
         <h1>Taxi Streaming ETL</h1>
-        <p className="lede">
-          Модель вашого демо з випадковими подіями. У Producer можна змінити JSON перед надсиланням: поставте той самий
-          event_id, невідомий район, старий час або зламайте JSON і подивіться, як відреагує consumer.
-        </p>
       </header>
       <Controls
         playing={playing} consumerOn={consumerOn} counter={counter}

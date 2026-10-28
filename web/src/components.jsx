@@ -244,7 +244,7 @@ export const BatchPanel = forwardRef(function BatchPanel({ runs, freshRun }, ref
       <h2>Batch: БД taxi_analytics</h2>
       <p className="hint" style={{ marginBottom: 12 }}>
         Кнопка «Batch example» одним запитом бере з taxi_events усі події за останні 2 хвилини (рахуючи від найновішої
-        події) і однією транзакцією записує аналітику в окрему базу. Це робить <span className="mono">batch_job.py</span>.
+        події) і однією транзакцією записує аналітику в окрему базу.
         Стрімінг-consumer при цьому нічого не знає про цю базу.
       </p>
       {runs.length
